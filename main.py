@@ -14,6 +14,19 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.padding import PKCS7
 from scipy.stats import chisquare
 
+class MockKMS:
+    def generate_data_key(self):
+        """Generate a new data encryption key."""
+        return b'\x00' * 32  # Simulated key generation
+
+    def encrypt_data_key(self, key):
+        """Encrypt the data encryption key with a master key."""
+        return b'\x01' * 32  # Simulated key encryption
+
+    def decrypt_data_key(self, encrypted_key):
+        """Decrypt the data encryption key with a master key."""
+        return b'\x00' * 32  # Simulated key decryption
+
 def initialize_triangles(base):
     """Initialize triangles for Penrose tiling."""
     triangles = []
@@ -82,44 +95,59 @@ def assess_entropy(choices):
     _, p_value = chisquare(list(freqs.values()))  # Chi-squared test for randomness
     return p_value >= 0.01  # Threshold for statistical significance
 
-def main(base, divisions, message):
+def main(base, divisions, message, kms):
     """Main function to execute the script's functionality."""
     phi = (1 + np.sqrt(5)) / 2
     salt = os.urandom(32)  # Increased salt size for better security
 
     try:
-        triangles = initialize_triangles(base)
-        choices = []
-        for _ in range(divisions):
-            new_triangles = []
-            for shape, v1, v2, v3 in triangles:
-                choice = os.urandom(1)  # Use cryptographically secure PRNG for choice selection
-                choices.append(choice)
-                new_triangles.extend(subdivision_logic(shape, v1, v2, v3, phi, choice))
-            triangles = new_triangles
-        choices = b''.join(choices)  # Concatenate choices as bytes for seed generation
-        freqs = Counter(choices)
-        _, p_value = chisquare(list(freqs.values()))  # Calculate p-value for entropy assessment
-        if p_value < 0.01:
-            raise ValueError("Insufficient entropy for key generation.")
-        seed = hashlib.sha256(choices + str(base).encode()).digest()  # Incorporate choices and base into seed
-        derived_key = derive_key(seed, salt)
-        encrypted_message = encrypt_message(derived_key, message)
-        
+        if kms:
+            # Initialize the KMS (hypothetical)
+            kms_client = MockKMS()
+
+            # Generate a data encryption key
+            data_key = kms_client.generate_data_key()
+
+            # Encrypt the data encryption key with a master key (hypothetical)
+            encrypted_data_key = kms_client.encrypt_data_key(data_key)
+
+            # Encrypt the message using the data encryption key
+            encrypted_message = encrypt_message(data_key, message)
+
+        else:
+            triangles = initialize_triangles(base)
+            choices = []
+            for _ in range(divisions):
+                new_triangles = []
+                for shape, v1, v2, v3 in triangles:
+                    choice = os.urandom(1)  # Use cryptographically secure PRNG for choice selection
+                    choices.append(choice)
+                    new_triangles.extend(subdivision_logic(shape, v1, v2, v3, phi, choice))
+                triangles = new_triangles
+            choices = b''.join(choices)  # Concatenate choices as bytes for seed generation
+            freqs = Counter(choices)
+            _, p_value = chisquare(list(freqs.values()))  # Calculate p-value for entropy assessment
+            if p_value < 0.01:
+                raise ValueError("Insufficient entropy for key generation.")
+            seed = hashlib.sha256(choices + str(base).encode()).digest()  # Incorporate choices and base into seed
+            derived_key = derive_key(seed, salt)
+            encrypted_message = encrypt_message(derived_key, message)
+
         # Print encrypted message and derived key
-        print(f"Derived Key (Base64): {base64.b64encode(derived_key).decode()}")
+        print(f"Derived Key (Base64): {base64.b64encode(data_key if kms else derived_key).decode()}")
         print(f"Encrypted Message (Hex): {encrypted_message.hex()}")
-        
-        # Decrypt and verify message
-        decrypted_message = decrypt_message(derived_key, encrypted_message)
-        assert decrypted_message == message, "Decryption failed or message tampered"
-        print("Decryption successful.")
-        
-        # Print security information
-        print(f"Entropy Assessment P-value: {p_value}")
-        print(f"Salt Value: {salt.hex()}")
-        print(f"Key Derivation Information: HKDF with SHA256, salt={salt}, info=b'penrose-tiling-key'")
-        
+
+        if not kms:
+            # Decrypt and verify message
+            decrypted_message = decrypt_message(derived_key, encrypted_message)
+            assert decrypted_message == message, "Decryption failed or message tampered"
+            print("Decryption successful.")
+
+            # Print security information
+            print(f"Entropy Assessment P-value: {p_value}")
+            print(f"Salt Value: {salt.hex()}")
+            print(f"Key Derivation Information: HKDF with SHA256, salt={salt}, info=b'penrose-tiling-key'")
+
     except Exception as e:
         print(f"An error occurred: {e}")
 
@@ -144,7 +172,8 @@ if __name__ == "__main__":
     parser.add_argument("--base", type=int, default=5, help="Base size for Penrose tiling")
     parser.add_argument("--divisions", type=int, default=4, help="Number of subdivisions for tiling")
     parser.add_argument("--message", type=str, help="Message to encrypt")
+    parser.add_argument("--kms", action="store_true", help="Use Key Management Service (KMS)")
     args = parser.parse_args()
-    
-    main(args.base, args.divisions, args.message)
+
+    main(args.base, args.divisions, args.message, args.kms)
     unittest.main(argv=['first-arg-is-ignored'], exit=False)
