@@ -1,36 +1,109 @@
+import math, hashlib, secrets, argparse, base64, os, unittest, logging, base64, os
 import numpy as np
-import math
-import hashlib
-import secrets
-import argparse
-import base64
-import os
-import unittest
-import logging
 from collections import Counter
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.padding import PKCS7
-from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
 from scipy.stats import chisquare
+from cryptography.hazmat.primitives.serialization import load_pem_private_key, load_pem_public_key
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class MockKMS:
-    def __init__(self, base, divisions):
+    def __init__(self, base, divisions, key_storage_path='key_storage.txt'):
         self.base = base
         self.divisions = divisions
-        self.master_key = self._generate_master_key()
+        self.key_storage_path = key_storage_path
+        self.load_or_generate_keys()
+
+    def load_or_generate_keys(self):
+        """Load keys from storage or generate them if they don't exist."""
+        try:
+            with open(self.key_storage_path, 'r') as key_file:
+                stored_keys = key_file.read().splitlines()
+                self.aes_key = base64.b64decode(stored_keys[0])
+
+                # Deserialize the ECDSA private key
+                ecdsa_private_key_pem = base64.b64decode(stored_keys[1])
+                self.ecdsa_private_key = load_pem_private_key(
+                    ecdsa_private_key_pem,
+                    password=None,  # No encryption password
+                    backend=default_backend()
+                )
+
+                # Deserialize the ECDSA public key
+                ecdsa_public_key_pem = base64.b64decode(stored_keys[2])
+                self.ecdsa_public_key = load_pem_public_key(
+                    ecdsa_public_key_pem,
+                    backend=default_backend()
+                )
+
+                logging.info("Keys loaded from storage.")
+        except FileNotFoundError:
+            logging.info("Key storage not found, generating new keys.")
+            self.ecdsa_private_key, self.ecdsa_public_key = self._generate_ecdsa_keys()
+            self.aes_key = self._generate_aes_key()
+            self.store_keys()
+
+    def store_keys(self):
+        """Store keys to the file."""
+        try:
+            with open(self.key_storage_path, 'w') as key_file:
+                # Serialize the AES key directly since it's already bytes-like
+                key_file.write(base64.b64encode(self.aes_key).decode() + '\n')
+                
+                # Serialize the ECDSA private key to PEM format and then encode it
+                ecdsa_private_key_pem = self.ecdsa_private_key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.PKCS8,
+                    encryption_algorithm=serialization.NoEncryption()
+                )
+                key_file.write(base64.b64encode(ecdsa_private_key_pem).decode() + '\n')
+                
+                # Serialize the ECDSA public key to PEM format and then encode it
+                ecdsa_public_key_pem = self.ecdsa_public_key.public_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo
+                )
+                key_file.write(base64.b64encode(ecdsa_public_key_pem).decode() + '\n')
+            
+            logging.info("Keys stored securely.")
+        except Exception as e:
+            logging.error(f"Failed to store keys: {e}")
+
+    def _generate_ecdsa_keys(self):
+        """Generate ECDSA keys."""
+        choices = self._generate_entropy()
+        seed = self._generate_seed(choices)
+        return generate_ecdsa_keys(seed)
+
+    def _generate_aes_key(self):
+        """Generate an AES key for encryption/decryption."""
+        choices = self._generate_entropy()
+        seed = self._generate_seed(choices)
+        return self._derive_key(seed)
 
     def _generate_master_key(self):
         """Generate the master key using Penrose tiling-based entropy."""
         choices = self._generate_entropy()
         seed = self._generate_seed(choices)
-        return self._derive_key(seed)
+        return self._derive_ecdsa_keys(seed)
+
+    def _derive_key(self, seed):
+        """Derive a cryptographic key from the seed."""
+        salt = secrets.token_bytes(16)
+        hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=b'penrose-tiling-key', backend=default_backend())
+        derived_key = hkdf.derive(seed)
+        if not isinstance(derived_key, bytes):
+            logging.error("_derive_key: The derived key is not in bytes format.")
+        return derived_key
 
     def _generate_entropy(self):
         """Generate entropy based on Penrose tiling."""
@@ -41,11 +114,9 @@ class MockKMS:
         """Generate a seed from the choices."""
         return hashlib.sha256(choices.encode()).digest()
 
-    def _derive_key(self, seed):
-        """Derive a cryptographic key from the seed."""
-        salt = secrets.token_bytes(16)
-        hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=b'penrose-tiling-key', backend=default_backend())
-        return hkdf.derive(seed)
+    def _derive_ecdsa_keys(self, seed):
+        """Derive ECDSA keys from the seed."""
+        return generate_ecdsa_keys(seed)
 
     def generate_data_key(self):
         """Generate a new data encryption key using Penrose tiling-based entropy."""
@@ -53,24 +124,54 @@ class MockKMS:
         return self._derive_key(self._generate_seed(choices))
 
     def encrypt_data_key(self, key):
-        """Encrypt the data encryption key with the master key."""
+        """Encrypt the data encryption key with the AES key."""
         try:
-            aesgcm = AESGCM(self.master_key)
+            aesgcm = AESGCM(self.aes_key)
             nonce = secrets.token_bytes(12)
-            return nonce + aesgcm.encrypt(nonce, key, None)
+            encrypted_key = aesgcm.encrypt(nonce, key, None)  # 'key' must be a bytes-like object
+            return nonce + encrypted_key
         except Exception as e:
             logging.error(f"Data key encryption error: {e}")
             return None
 
     def decrypt_data_key(self, encrypted_key):
-        """Decrypt the data encryption key with the master key."""
+        """Decrypt the data encryption key with the AES key."""
         try:
-            aesgcm = AESGCM(self.master_key)
+            aesgcm = AESGCM(self.aes_key)  # Use the AES key dedicated for encryption/decryption
             nonce = encrypted_key[:12]
             return aesgcm.decrypt(nonce, encrypted_key[12:], None)
         except Exception as e:
             logging.error(f"Data key decryption error: {e}")
             return None
+
+    def sign_message(self, message):
+        """Sign a message using the ECDSA private key."""
+        return sign_message(self.ecdsa_private_key, message)  # Use ECDSA private key
+
+    def verify_signature(self, message, signature):
+        """Verify a message signature using the ECDSA public key."""
+        return verify_signature(self.ecdsa_public_key, message, signature)  # Use ECDSA public key
+
+def generate_ecdsa_keys(seed):
+    """Generate ECDSA keys using entropy from a seed."""
+    private_key = ec.derive_private_key(int.from_bytes(seed, byteorder='big'), ec.SECP256R1(), default_backend())
+    return private_key, private_key.public_key()
+
+def sign_message(private_key, message):
+    """Sign a message using the ECDSA private key."""
+    signature = private_key.sign(
+        message.encode(),
+        ec.ECDSA(hashes.SHA256())
+    )
+    return signature
+
+def verify_signature(public_key, message, signature):
+    """Verify a message signature using the ECDSA public key."""
+    try:
+        public_key.verify(signature, message.encode(), ec.ECDSA(hashes.SHA256()))
+        return True
+    except InvalidSignature:
+        return False
 
 def initialize_triangles(base):
     """Initialize triangles for Penrose tiling."""
@@ -204,56 +305,44 @@ class TestEncryptionVulnerability(unittest.TestCase):
 
 def main(base, divisions, message, use_kms=True):
     """Main function to execute the script's functionality."""
-    phi = (1 + np.sqrt(5)) / 2
+    phi = (1 + math.sqrt(5)) / 2
     salt = os.urandom(32)  # Increased salt size for better security
 
     try:
-        if use_kms:
-            kms = MockKMS(base, divisions)
-            data_key = kms.generate_data_key()
+        # Initialize MockKMS with Penrose tiling parameters
+        kms = MockKMS(base, divisions)
+        
+        # Generate and encrypt a data key
+        data_key = kms.generate_data_key()
+        encrypted_key = kms.encrypt_data_key(data_key)
 
-            encrypted_key = kms.encrypt_data_key(data_key)
-            if encrypted_key:
-                logging.info(f"Encrypted Data Key: {base64.b64encode(encrypted_key).decode()}")
+        if encrypted_key:
+            logging.info(f"Encrypted Data Key: {base64.b64encode(encrypted_key).decode()}")
 
-                decrypted_key = kms.decrypt_data_key(encrypted_key)
-                if decrypted_key:
-                    logging.info("Data key decrypted successfully.")
-                    
-                    # Encrypt the message using the data encryption key
-                    iv = generate_iv(base, divisions)
-                    encrypted_message = encrypt_message(data_key, iv, message)
+            # Decrypt the data key
+            decrypted_key = kms.decrypt_data_key(encrypted_key)
+            if decrypted_key:
+                logging.info("Data key decrypted successfully.")
+                
+                # Encrypt the message using the decrypted data key
+                iv = generate_iv(base, divisions)
+                encrypted_message = encrypt_message(decrypted_key, iv, message)
+                logging.info(f"Encrypted Message (Hex): {base64.b64encode(encrypted_message).decode()}")
 
-                    logging.info(f"Encrypted Message (Hex): {base64.b64encode(encrypted_message).decode()}")
+                # Sign the original message using the ECDSA private key from MockKMS
+                signature = kms.sign_message(message)
+                logging.info(f"Signature: {base64.b64encode(signature).decode()}")
+
+                # Verify the signature using the ECDSA public key from MockKMS
+                verification_result = kms.verify_signature(message, signature)
+                if verification_result:
+                    logging.info("Signature verified successfully.")
                 else:
-                    logging.error("Failed to decrypt data key.")
+                    logging.error("Failed to verify signature.")
             else:
-                logging.error("Failed to encrypt data key.")
+                logging.error("Failed to decrypt data key.")
         else:
-            triangles, choices = subdivide_triangles(initialize_triangles(base), divisions, phi)
-            entropy_ok = assess_entropy(choices)
-            if not entropy_ok:
-                raise ValueError("Insufficient entropy for key generation.")
-            seed = generate_seed(choices, base)
-            derived_key = derive_key(seed, salt)
-                    
-            # Encrypt the message using the data encryption key
-            iv = generate_iv(base, divisions)
-            encrypted_message = encrypt_message(derived_key, iv, message)
-
-            # Decrypt and verify message
-            decrypted_message = decrypt_message(derived_key, iv, encrypted_message)
-            assert decrypted_message == message, "Decryption failed or message tampered"
-            logging.info("Decryption successful.")
-
-            # Print derived key, encrypted message, and entropy assessment
-            logging.info(f"Derived Key (Base64): {base64.b64encode(derived_key).decode()}")
-            logging.info(f"Encrypted Message (Hex): {base64.b64encode(encrypted_message).decode()}")
-            logging.info(f"Entropy Assessment OK: {entropy_ok}")
-
-            # Print common security information
-            logging.info(f"Salt Value: {salt.hex()}")
-            logging.info(f"Key Derivation Information: HKDF with SHA256, salt={salt}, info=b'penrose-tiling-key'")
+            logging.error("Failed to encrypt data key.")
 
     except Exception as e:
         logging.error(f"An error occurred: {e}")
