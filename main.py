@@ -12,71 +12,97 @@ from cryptography.hazmat.primitives import serialization
 from scipy.stats import chisquare
 from cryptography.hazmat.primitives.serialization import load_pem_private_key, load_pem_public_key
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import padding
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+
 class MockKMS:
-    def __init__(self, base, divisions, key_storage_path='key_storage.txt'):
+    def __init__(self, base, divisions, passphrase, key_storage_path='key_storage.txt'):
         self.base = base
         self.divisions = divisions
+        self.passphrase = passphrase.encode()  # Ensure the passphrase is bytes-like
         self.key_storage_path = key_storage_path
         self.load_or_generate_keys()
 
-    def load_or_generate_keys(self):
-        """Load keys from storage or generate them if they don't exist."""
+    def _get_encryption_key(self, salt):
+        """Derive an encryption key from the passphrase."""
+        kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000, backend=default_backend())
+        return kdf.derive(self.passphrase)
+
+    def _encrypt_data(self, data, key):
+        """Encrypt data using AES."""
+        padder = padding.PKCS7(128).padder()
+        padded_data = padder.update(data) + padder.finalize()
+        iv = os.urandom(16)
+        cipher = Cipher(algorithms.AES(key), modes.CFB(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        ct = encryptor.update(padded_data) + encryptor.finalize()
+        return iv + ct
+
+    def _decrypt_data(self, encrypted_data, key):
+        """Decrypt data using AES."""
+        iv, ct = encrypted_data[:16], encrypted_data[16:]
+        cipher = Cipher(algorithms.AES(key), modes.CFB(iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        padded_data = decryptor.update(ct) + decryptor.finalize()
+        unpadder = padding.PKCS7(128).unpadder()
+        return unpadder.update(padded_data) + unpadder.finalize()
+
+    def store_keys(self):
+        """Encrypt and store keys to the file."""
         try:
-            with open(self.key_storage_path, 'r') as key_file:
-                stored_keys = key_file.read().splitlines()
+            salt = os.urandom(16)
+            encryption_key = self._get_encryption_key(salt)
+            # Prepare data for encryption
+            data_to_store = '\n'.join([
+                base64.b64encode(self.aes_key).decode(),
+                base64.b64encode(self.ecdsa_private_key.private_bytes(encoding=serialization.Encoding.PEM, format=serialization.PrivateFormat.PKCS8, encryption_algorithm=serialization.NoEncryption())).decode(),
+                base64.b64encode(self.ecdsa_public_key.public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo)).decode()
+            ]).encode()
+            encrypted_data = self._encrypt_data(data_to_store, encryption_key)
+            with open(self.key_storage_path, 'wb') as key_file:
+                key_file.write(salt + encrypted_data)
+            logging.info("Keys stored securely with encryption.")
+        except Exception as e:
+            logging.error(f"Failed to store keys securely: {e}")
+
+    def load_or_generate_keys(self):
+        """Decrypt and load keys from storage, or generate them if they don't exist."""
+        try:
+            with open(self.key_storage_path, 'rb') as key_file:
+                salt = key_file.read(16)  # The first 16 bytes are the salt
+                encrypted_data = key_file.read()
+                encryption_key = self._get_encryption_key(salt)
+                decrypted_data = self._decrypt_data(encrypted_data, encryption_key)
+                stored_keys = decrypted_data.decode().splitlines()
+
+                # Deserialize and set the AES key
                 self.aes_key = base64.b64decode(stored_keys[0])
 
-                # Deserialize the ECDSA private key
+                # Deserialize and set the ECDSA private key
                 ecdsa_private_key_pem = base64.b64decode(stored_keys[1])
-                self.ecdsa_private_key = load_pem_private_key(
+                self.ecdsa_private_key = serialization.load_pem_private_key(
                     ecdsa_private_key_pem,
-                    password=None,  # No encryption password
+                    password=None,
                     backend=default_backend()
                 )
 
-                # Deserialize the ECDSA public key
+                # Deserialize and set the ECDSA public key
                 ecdsa_public_key_pem = base64.b64decode(stored_keys[2])
-                self.ecdsa_public_key = load_pem_public_key(
+                self.ecdsa_public_key = serialization.load_pem_public_key(
                     ecdsa_public_key_pem,
                     backend=default_backend()
                 )
 
-                logging.info("Keys loaded from storage.")
+                logging.info("Keys loaded from encrypted storage.")
         except FileNotFoundError:
-            logging.info("Key storage not found, generating new keys.")
-            self.ecdsa_private_key, self.ecdsa_public_key = self._generate_ecdsa_keys()
+            logging.info("Encrypted key storage not found, generating new keys.")
+            # Generate new keys if loading from storage fails
             self.aes_key = self._generate_aes_key()
-            self.store_keys()
-
-    def store_keys(self):
-        """Store keys to the file."""
-        try:
-            with open(self.key_storage_path, 'w') as key_file:
-                # Serialize the AES key directly since it's already bytes-like
-                key_file.write(base64.b64encode(self.aes_key).decode() + '\n')
-                
-                # Serialize the ECDSA private key to PEM format and then encode it
-                ecdsa_private_key_pem = self.ecdsa_private_key.private_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PrivateFormat.PKCS8,
-                    encryption_algorithm=serialization.NoEncryption()
-                )
-                key_file.write(base64.b64encode(ecdsa_private_key_pem).decode() + '\n')
-                
-                # Serialize the ECDSA public key to PEM format and then encode it
-                ecdsa_public_key_pem = self.ecdsa_public_key.public_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PublicFormat.SubjectPublicKeyInfo
-                )
-                key_file.write(base64.b64encode(ecdsa_public_key_pem).decode() + '\n')
-            
-            logging.info("Keys stored securely.")
-        except Exception as e:
-            logging.error(f"Failed to store keys: {e}")
+            self.ecdsa_private_key, self.ecdsa_public_key = self._generate_ecdsa_keys()
+            self.store_keys()  # Store the newly generated keys
 
     def _generate_ecdsa_keys(self):
         """Generate ECDSA keys."""
@@ -303,14 +329,14 @@ class TestEncryptionVulnerability(unittest.TestCase):
         decrypted_message = decrypt_message(attacker_key, iv, encrypted_message)
         self.assertEqual(decrypted_message, message, "Attack failed, decryption with recreated weak key did not succeed")
 
-def main(base, divisions, message, use_kms=True):
+def main(base, divisions, message, passphrase, use_kms=True):
     """Main function to execute the script's functionality."""
     phi = (1 + math.sqrt(5)) / 2
     salt = os.urandom(32)  # Increased salt size for better security
 
     try:
         # Initialize MockKMS with Penrose tiling parameters
-        kms = MockKMS(base, divisions)
+        kms = MockKMS(base, divisions, passphrase)
         
         # Generate and encrypt a data key
         data_key = kms.generate_data_key()
@@ -352,7 +378,8 @@ if __name__ == "__main__":
     parser.add_argument("--base", type=int, default=5, help="Base size for Penrose tiling")
     parser.add_argument("--divisions", type=int, default=4, help="Number of subdivisions for tiling")
     parser.add_argument("--message", type=str, required=True, help="Message to encrypt")
+    parser.add_argument("--passphrase", type=str, required=True, help="Passphrase for key encryption")
     parser.add_argument("--use_kms", action="store_true", help="Use Key Management Service (KMS) simulation")
     args = parser.parse_args()
 
-    main(args.base, args.divisions, args.message, args.use_kms)
+    main(args.base, args.divisions, args.message, args.passphrase, args.use_kms)
