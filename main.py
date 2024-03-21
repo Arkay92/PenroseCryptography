@@ -1,4 +1,4 @@
-import math, hashlib, secrets, argparse, base64, os, unittest, logging, base64, os
+import math, hashlib, secrets, argparse, base64, os, unittest, logging
 import numpy as np
 from collections import Counter
 from cryptography.hazmat.primitives import hashes
@@ -29,6 +29,68 @@ class MockKMS:
         self.ecdsa_private_key = None
         self.ecdsa_public_key = None
         self.load_or_generate_keys()
+
+    def generate_vrf_proof(self, message):
+        """Generate a VRF proof for a given message."""
+        vrf_output = self._generate_vrf_output(message, self.ecdsa_private_key)
+        proof = self.sign_message_with_private_key(vrf_output, self.ecdsa_private_key)
+        return vrf_output, proof
+
+    def verify_vrf_proof(self, message, vrf_output, proof):
+        """Verify a VRF proof for a given message."""
+        expected_vrf_output = self._generate_vrf_output(message, self.ecdsa_public_key)
+        try:
+            # Verify the proof against the expected VRF output
+            self.verify_signature_with_public_key(vrf_output, proof, self.ecdsa_public_key)
+            print("Proof verification succeeded.")
+            return True  # Signature verification succeeded
+        except InvalidSignature:
+            print("Proof verification failed.")
+            return False  # Signature verification failed
+
+    def _generate_vrf_output(self, message, key):
+        """Generate a deterministic 'random' value from a message and a key (private or public)."""
+        # Ensure the message is in bytes
+        message_bytes = message.encode() if isinstance(message, str) else message
+
+        # Sign the message with the private key to generate a signature
+        if isinstance(key, ec.EllipticCurvePrivateKey):
+            signature = self.sign_message_with_private_key(message_bytes, key)
+            data_to_hash = signature + message_bytes
+        elif isinstance(key, ec.EllipticCurvePublicKey):
+            hashed_message = hashlib.sha256(message_bytes).digest()
+            data_to_hash = self.public_key_operation(hashed_message, key)
+        else:
+            raise ValueError("Key must be an ECDSA private or public key")
+
+        # Hash the combination of the signature and message (for private key) or the "encrypted" hash (for public key)
+        return hashlib.sha256(data_to_hash).digest()
+
+    def sign_message_with_private_key(self, message, private_key):
+        """Sign a message using the ECDSA private key."""
+        signature = private_key.sign(
+            message,
+            ec.ECDSA(hashes.SHA256())
+        )
+        return signature
+
+    def verify_signature_with_public_key(self, message, signature, public_key):
+        """Verify a message signature using the ECDSA public key."""
+        public_key.verify(
+            signature,
+            message,
+            ec.ECDSA(hashes.SHA256())
+        )
+
+    def public_key_operation(self, data, public_key):
+        """Perform a deterministic operation with the public key on the given data.
+        This is a workaround to simulate 'using' the public key, as ECDSA doesn't support encryption.
+        One approach is to hash the data concatenated with the serialized public key."""
+        public_key_bytes = public_key.public_bytes(
+            encoding=serialization.Encoding.X962,
+            format=serialization.PublicFormat.UncompressedPoint
+        )
+        return hashlib.sha256(data + public_key_bytes).digest()
 
     def _get_encryption_key(self, salt):
         """Derive an encryption key from the passphrase."""
@@ -378,6 +440,19 @@ def main(base, divisions, message, passphrase, use_kms=True):
         # Initialize MockKMS with Penrose tiling parameters
         kms = MockKMS(base, divisions, passphrase)
         
+        # Generate VRF proof for the message
+        vrf_output, proof = kms.generate_vrf_proof(message)
+
+        logging.info(f"VRF Output (Hex): {vrf_output.hex()}")
+        logging.info(f"Proof (Hex): {proof.hex()}")
+
+        # Verify VRF proof
+        verification_result = kms.verify_vrf_proof(message, vrf_output, proof)
+        if verification_result:
+            logging.info("VRF proof verified successfully.")
+        else:
+            logging.error("Failed to verify VRF proof.")
+
         # Generate and encrypt a data key
         data_key = kms.generate_data_key()
         encrypted_key = kms.encrypt_data_key(data_key)
