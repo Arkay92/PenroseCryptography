@@ -13,17 +13,21 @@ from scipy.stats import chisquare
 from cryptography.hazmat.primitives.serialization import load_pem_private_key, load_pem_public_key
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import padding
+from io import StringIO
+from unittest.mock import patch
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
 
 class MockKMS:
     def __init__(self, base, divisions, passphrase, key_storage_path='key_storage.txt'):
         self.base = base
         self.divisions = divisions
-        self.passphrase = passphrase.encode()  # Ensure the passphrase is bytes-like
+        self.passphrase = passphrase.encode()
         self.key_storage_path = key_storage_path
+        self.aes_key = None
+        self.ecdsa_private_key = None
+        self.ecdsa_public_key = None
         self.load_or_generate_keys()
 
     def _get_encryption_key(self, salt):
@@ -69,40 +73,27 @@ class MockKMS:
             logging.error(f"Failed to store keys securely: {e}")
 
     def load_or_generate_keys(self):
-        """Decrypt and load keys from storage, or generate them if they don't exist."""
+        logging.info("Loading or generating keys...")
         try:
             with open(self.key_storage_path, 'rb') as key_file:
-                salt = key_file.read(16)  # The first 16 bytes are the salt
-                encrypted_data = key_file.read()
+                salt, encrypted_data = key_file.read(16), key_file.read()
                 encryption_key = self._get_encryption_key(salt)
                 decrypted_data = self._decrypt_data(encrypted_data, encryption_key)
-                stored_keys = decrypted_data.decode().splitlines()
+                aes_key_str, ecdsa_private_key_str, ecdsa_public_key_str = decrypted_data.decode().split('\n')
 
-                # Deserialize and set the AES key
-                self.aes_key = base64.b64decode(stored_keys[0])
-
-                # Deserialize and set the ECDSA private key
-                ecdsa_private_key_pem = base64.b64decode(stored_keys[1])
+                self.aes_key = base64.b64decode(aes_key_str)
                 self.ecdsa_private_key = serialization.load_pem_private_key(
-                    ecdsa_private_key_pem,
-                    password=None,
-                    backend=default_backend()
-                )
-
-                # Deserialize and set the ECDSA public key
-                ecdsa_public_key_pem = base64.b64decode(stored_keys[2])
+                    base64.b64decode(ecdsa_private_key_str), password=None, backend=default_backend())
                 self.ecdsa_public_key = serialization.load_pem_public_key(
-                    ecdsa_public_key_pem,
-                    backend=default_backend()
-                )
+                    base64.b64decode(ecdsa_public_key_str), backend=default_backend())
 
-                logging.info("Keys loaded from encrypted storage.")
-        except FileNotFoundError:
-            logging.info("Encrypted key storage not found, generating new keys.")
-            # Generate new keys if loading from storage fails
+                logging.info("Keys successfully loaded from storage.")
+        except Exception as e:
+            logging.error(f"Failed to load keys from storage: {e}, generating new ones.")
             self.aes_key = self._generate_aes_key()
             self.ecdsa_private_key, self.ecdsa_public_key = self._generate_ecdsa_keys()
-            self.store_keys()  # Store the newly generated keys
+            self.store_keys()
+
 
     def _generate_ecdsa_keys(self):
         """Generate ECDSA keys."""
@@ -329,6 +320,55 @@ class TestEncryptionVulnerability(unittest.TestCase):
         decrypted_message = decrypt_message(attacker_key, iv, encrypted_message)
         self.assertEqual(decrypted_message, message, "Attack failed, decryption with recreated weak key did not succeed")
 
+class TestRandomnessAndCryptography(unittest.TestCase):
+    
+    @patch.object(MockKMS, 'load_or_generate_keys')
+    def setUp(self, mock_load_keys=None):
+        # Initialize MockKMS without relying on external files
+        self.kms = MockKMS(base=5, divisions=4, passphrase='test_passphrase')
+        # Since load_or_generate_keys is mocked, manually generate the keys
+        self.kms.aes_key = self.kms._generate_aes_key()
+        self.kms.ecdsa_private_key, self.kms.ecdsa_public_key = self.kms._generate_ecdsa_keys()
+
+    def test_entropy_generation(self):
+        # Generate entropy multiple times and assess the diversity of output
+        entropies = set()
+        for _ in range(100):
+            entropy = self.kms._generate_entropy()
+            self.assertIsInstance(entropy, str)
+            entropies.add(entropy)
+        # Check if we have a reasonable diversity of outputs
+        self.assertTrue(len(entropies) > 90)
+
+    def test_key_generation(self):
+        # Test AES key generation
+        aes_key = self.kms._generate_aes_key()
+        self.assertEqual(len(aes_key), 32)  # AES keys should be 32 bytes for AES-256
+
+        # Test ECDSA key generation
+        ecdsa_private, ecdsa_public = self.kms._generate_ecdsa_keys()
+        self.assertTrue(ecdsa_private and ecdsa_public)
+
+    def test_encryption_decryption_consistency(self):
+        # Encrypt and decrypt a message and check for consistency
+        message = b'This is a test message'
+        aes_key = self.kms._generate_aes_key()
+        encrypted_message = self.kms._encrypt_data(message, aes_key)
+        decrypted_message = self.kms._decrypt_data(encrypted_message, aes_key)
+        self.assertEqual(message, decrypted_message)
+
+    def test_signature_verification(self):
+        # Sign a message and verify the signature
+        message = "Test message"
+        signature = sign_message(self.kms.ecdsa_private_key, message)
+        verification_result = verify_signature(self.kms.ecdsa_public_key, message, signature)
+        self.assertTrue(verification_result)
+
+        # Test verification with an incorrect signature
+        incorrect_signature = b'wrong'
+        verification_result = verify_signature(self.kms.ecdsa_public_key, message, incorrect_signature)
+        self.assertFalse(verification_result)
+
 def main(base, divisions, message, passphrase, use_kms=True):
     """Main function to execute the script's functionality."""
     phi = (1 + math.sqrt(5)) / 2
@@ -369,6 +409,28 @@ def main(base, divisions, message, passphrase, use_kms=True):
                 logging.error("Failed to decrypt data key.")
         else:
             logging.error("Failed to encrypt data key.")
+        
+        # Define the test suite for TestRandomnessAndCryptography
+        loader = unittest.TestLoader()
+        suite = loader.loadTestsFromTestCase(TestRandomnessAndCryptography)
+
+        # Run the tests and output the results to the console
+        runner = unittest.TextTestRunner(verbosity=2)  # Set verbosity to 2 for detailed output
+        print("\nRunning TestRandomnessAndCryptography test suite:")
+        result = runner.run(suite)  # Capture the result of the test run
+
+        # Log the test results summary using the result variable
+        logging.info(f"Ran {result.testsRun} tests.")
+        if not result.wasSuccessful():
+            logging.error("One or more tests failed.")
+        if result.failures:
+            logging.error(f"Failures: {len(result.failures)}")
+            for test, traceback in result.failures:
+                logging.error(f"Failure: {test.id()}\nTraceback: {traceback}")
+        if result.errors:
+            logging.error(f"Errors: {len(result.errors)}")
+            for test, traceback in result.errors:
+                logging.error(f"Error: {test.id()}\nTraceback: {traceback}")
 
     except Exception as e:
         logging.error(f"An error occurred: {e}")
