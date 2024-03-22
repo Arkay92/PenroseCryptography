@@ -1,4 +1,4 @@
-import math, hashlib, secrets, argparse, base64, os, unittest, logging
+import math, hashlib, secrets, argparse, base64, os, unittest, logging, subprocess, ssl, socket
 import numpy as np
 from collections import Counter
 from cryptography.hazmat.primitives import hashes
@@ -29,6 +29,64 @@ class MockKMS:
         self.ecdsa_private_key = None
         self.ecdsa_public_key = None
         self.load_or_generate_keys()
+
+    def run_secure_service(self, cert_path="cert.pem", key_path="key.pem"):
+        """Runs the KMS service with TLS support."""
+        generate_self_signed_cert(cert_path, key_path)
+
+        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(('localhost', 8443))
+            sock.listen(5)
+            logging.info("Secure KMS service running on localhost:8443")
+            with context.wrap_socket(sock, server_side=True) as ssock:
+                while True:
+                    client_socket, address = ssock.accept()
+                    logging.info(f"Secure connection established with {address}")
+                    
+                    # Handle the connection
+                    try:
+                        while True:
+                            data = client_socket.recv(1024)
+                            if not data:
+                                break  # Client closed connection
+
+                            # Decode the received data
+                            message = data.decode('utf-8')
+                            logging.info(f"Received message: {message}")
+
+                            # Process the message
+                            response = self.process_message(message)
+
+                            # Send the response back to the client
+                            client_socket.sendall(response.encode('utf-8'))
+                    except Exception as e:
+                        logging.error(f"Error handling client {address}: {e}")
+                    finally:
+                        client_socket.close()
+
+    def process_message(self, message):
+        """Process the message received from the client and perform operations based on it."""
+        try:
+            # For simplicity, let's assume the message format is "operation|data"
+            operation, data = message.split("|", 1)
+
+            if operation == "generate_vrf":
+                vrf_output, proof = self.generate_vrf_proof(data)
+                return f"VRF output: {vrf_output.hex()}, Proof: {proof.hex()}"
+            elif operation == "verify_vrf":
+                message, vrf_output, proof = data.split(",")
+                result = self.verify_vrf_proof(message, bytes.fromhex(vrf_output), bytes.fromhex(proof))
+                return "VRF verification result: " + ("Success" if result else "Failure")
+            # Add more operations as needed
+
+        except Exception as e:
+            logging.error(f"Error processing message: {e}")
+            return "Error processing message"
+
+        return "Operation not supported"
 
     def generate_vrf_proof(self, message):
         """Generate a VRF proof for a given message."""
@@ -230,6 +288,35 @@ class MockKMS:
     def verify_signature(self, message, signature):
         """Verify a message signature using the ECDSA public key."""
         return verify_signature(self.ecdsa_public_key, message, signature)  # Use ECDSA public key
+
+class KMSClient:
+    def __init__(self, server_address=('localhost', 8443), cert_path='cert.pem'):
+        self.server_address = server_address
+        self.cert_path = cert_path
+        self.context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=self.cert_path)
+        self.context.check_hostname = False
+        self.context.verify_mode = ssl.CERT_REQUIRED
+
+    def send_message(self, message):
+        with socket.create_connection(self.server_address) as sock:
+            with self.context.wrap_socket(sock, server_hostname='localhost') as ssock:
+                logging.info(f"Securely connected to KMS service at {self.server_address}")
+                ssock.sendall(message.encode('utf-8'))
+                response = ssock.recv(4096).decode('utf-8')
+                return response
+
+def generate_self_signed_cert(cert_path="cert.pem", key_path="key.pem"):
+    """Generates a self-signed certificate and key if they don't already exist."""
+    try:
+        with open(cert_path) as cert, open(key_path) as key:
+            logging.info("Certificate and key already exist.")
+    except FileNotFoundError:
+        logging.info("Generating a new certificate and key...")
+        subprocess.call([
+            'openssl', 'req', '-x509', '-newkey', 'rsa:4096', '-keyout', key_path, 
+            '-out', cert_path, '-days', '365', '-nodes', '-subj', '/CN=localhost'
+        ])
+        logging.info("Certificate and key generated.")
 
 def generate_ecdsa_keys(seed):
     """Generate ECDSA keys using entropy from a seed."""
@@ -439,6 +526,14 @@ def main(base, divisions, message, passphrase, use_kms=True):
     try:
         # Initialize MockKMS with Penrose tiling parameters
         kms = MockKMS(base, divisions, passphrase)
+        
+        # Start the KMS service with TLS support
+        kms.run_secure_service()
+
+         # Create a KMS client and communicate with the KMS service
+        client = KMSClient()
+        response = client.send_message("generate_vrf|" + args.message)
+        logging.info(f"Response from KMS: {response}")
         
         # Generate VRF proof for the message
         vrf_output, proof = kms.generate_vrf_proof(message)
