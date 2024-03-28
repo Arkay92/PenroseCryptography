@@ -1,5 +1,6 @@
-import math, hashlib, secrets, argparse, base64, os, unittest, logging, subprocess, ssl, socket
+import math, hashlib, secrets, argparse, base64, os, unittest, logging, subprocess, ssl, socket, csv
 import numpy as np
+import pandas as pd
 from collections import Counter
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -15,12 +16,99 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import padding
 from io import StringIO
 from unittest.mock import patch
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.optimizers import Adam
+from sklearn.preprocessing import StandardScaler
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+input_shape = None
+
+class NeuralNetworkModel:
+    def __init__(self, learning_rate=0.001):
+        self.model = Sequential([
+            Dense(128, activation='relu', input_shape=(input_shape,)),
+            Dense(64, activation='relu'),
+            Dense(32, activation='relu'),
+            Dense(1, activation='sigmoid')  # Use 'sigmoid' for binary classification, 'softmax' for multi-class
+        ])
+        
+        self.model.compile(optimizer=Adam(learning_rate=learning_rate), loss='binary_crossentropy', metrics=['accuracy'])  # Use 'binary_crossentropy' for binary classification, 'categorical_crossentropy' for multi-class
+
+    def train(self, X_train, y_train, X_val, y_val, epochs=100, batch_size=32):
+        # Normalize the data
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_val_scaled = scaler.transform(X_val)
+
+        # Train the model
+        history = self.model.fit(X_train_scaled, y_train, validation_data=(X_val_scaled, y_val), epochs=epochs, batch_size=batch_size)
+        return history
+
+    def evaluate(self, X_test, y_test):
+        # Normalize the test data
+        scaler = StandardScaler()
+        X_test_scaled = scaler.transform(X_test)
+
+        # Evaluate the model
+        evaluation_metrics = self.model.evaluate(X_test_scaled, y_test)
+        accuracy = evaluation_metrics[1]  # Assuming accuracy is the second metric being evaluated
+        
+        # Log evaluation metrics
+        logging.info(f"Model accuracy: {accuracy}")
+
+class ModelTrainer:
+    def __init__(self, data, target):
+        self.data = data
+        self.target = target
+
+    def train_and_evaluate(self):
+        # Check if dataset exists
+        if not os.path.exists(entropy_dataset.filename):
+            logging.info("Dataset not found. Starting to collect entropy data...")
+            entropy_dataset.collect_entropy_data(num_entries=100)  # Collect 100 entries, adjust as needed
+        
+        # Proceed with loading and splitting the dataset
+        train_df, validation_df, test_df = entropy_dataset.load_and_split_data()
+
+        # Split the data into training, validation, and test sets
+        X_train, X_temp, y_train, y_temp = train_test_split(self.data, self.target, test_size=0.4, random_state=42)
+        X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+
+        # Initialize the neural network model
+        input_shape = X_train.shape[1]  # Number of features
+        input_shape=input_shape
+        model = NeuralNetworkModel()
+
+        # Train the model and validate
+        history = model.train(X_train, y_train, X_val, y_val, epochs=100, batch_size=32)
+
+        # Evaluate the model on the test set
+        model.evaluate(X_test, y_test)
+
+        # Optionally, log the training process or plot the learning curves using 'history'
+        logging.info(history.history['accuracy'], history.history['val_accuracy'])
+
+def generate_self_signed_cert(cert_path="cert.pem", key_path="key.pem"):
+    """Generates a self-signed certificate and key if they don't already exist."""
+    try:
+        with open(cert_path) as cert, open(key_path) as key:
+            logging.info("Certificate and key already exist.")
+    except FileNotFoundError:
+        logging.info("Generating a new certificate and key...")
+        subprocess.call([
+            'openssl', 'req', '-x509', '-newkey', 'rsa:4096', '-keyout', key_path, 
+            '-out', cert_path, '-days', '365', '-nodes', '-subj', '/CN=localhost'
+        ])
+        logging.info("Certificate and key generated.")
+
 class MockKMS:
-    def __init__(self, base, divisions, passphrase, key_storage_path='key_storage.txt'):
+    def __init__(self, base, divisions, passphrase, key_storage_path='key_storage.txt', input_shape=None):
         self.base = base
         self.divisions = divisions
         self.passphrase = passphrase.encode()
@@ -29,6 +117,11 @@ class MockKMS:
         self.ecdsa_private_key = None
         self.ecdsa_public_key = None
         self.load_or_generate_keys()
+        self.entropy_count = 0  # Counter for entropy generations
+        if input_shape is not None:
+            self.nn_model = NeuralNetworkModel(input_shape)  # Initialize the neural network model with the given input shape
+        else:
+            self.nn_model = None  # Defer initialization until the input shape is known
 
     def run_secure_service(self, cert_path="cert.pem", key_path="key.pem"):
         """Runs the KMS service with TLS support."""
@@ -214,7 +307,6 @@ class MockKMS:
             self.ecdsa_private_key, self.ecdsa_public_key = self._generate_ecdsa_keys()
             self.store_keys()
 
-
     def _generate_ecdsa_keys(self):
         """Generate ECDSA keys."""
         choices = self._generate_entropy()
@@ -243,9 +335,56 @@ class MockKMS:
         return derived_key
 
     def _generate_entropy(self):
-        """Generate entropy based on Penrose tiling."""
-        _, choices = subdivide_triangles(initialize_triangles(self.base), self.divisions, (1 + math.sqrt(5)) / 2)
-        return ''.join(choices)
+        # Existing entropy generation logic remains until the dataset is large enough
+        if entropy_dataset.is_large_enough():  # Define a method or condition to check dataset size
+            # Use the neural network to generate entropy
+            # Prepare input data for prediction
+            # input_data = prepare_input_for_prediction()
+            generated_entropy = self.nn_model.predict(input_data)
+            choices_str = convert_generated_entropy_to_choices(generated_entropy)  # Convert generated entropy to a choices string
+        else:
+            # Existing Penrose tiling-based entropy generation logic
+            _, choices = subdivide_triangles(initialize_triangles(self.base), self.divisions, (1 + math.sqrt(5)) / 2)
+            choices_str = ''.join(choices)
+
+        # The rest of the method remains unchanged
+        seed = self._generate_seed(choices_str)
+        randomness_score = assess_entropy(choices_str)
+        entropy_dataset.add_entry(self.base, self.divisions, choices_str, seed, randomness_score)
+        self.entropy_count += 1
+
+        return choices_str
+    
+    def preprocess_dataset_for_nn(df):
+        # Assuming 'df' is your dataframe and it contains both features and target
+        # Let's say the target column is named 'target'
+        X = df.drop('target', axis=1).values  # Features
+        y = df['target'].values  # Target
+
+        # Normalize features
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        # Split the dataset into training and validation sets
+        X_train, X_val, y_train, y_val = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+        
+        # Reshape data if required by the model, especially for time-series models like LSTM
+        X_train = X_train.reshape((X_train.shape[0], X_train.shape[1], 1))
+        X_val = X_val.reshape((X_val.shape[0], X_val.shape[1], 1))
+
+        return X_train, X_val, y_train, y_val
+
+    def invoke_training(self):
+        logging.info("Invoking training process for neural network...")
+        # Load the dataset
+        df = pd.read_csv(entropy_dataset.filename)
+
+        # Preprocess the dataset for neural network training
+        X_train, X_val, y_train, y_val = preprocess_dataset_for_nn(df)
+
+        # Train the neural network model
+        # Ensure your nn_model has a method 'build_and_train_model' defined to accept these parameters
+        self.nn_model.build_and_train_model(X_train, y_train, X_val, y_val)
 
     def _generate_seed(self, choices):
         """Generate a seed from the choices."""
@@ -305,126 +444,185 @@ class KMSClient:
                 response = ssock.recv(4096).decode('utf-8')
                 return response
 
-def generate_self_signed_cert(cert_path="cert.pem", key_path="key.pem"):
-    """Generates a self-signed certificate and key if they don't already exist."""
-    try:
-        with open(cert_path) as cert, open(key_path) as key:
-            logging.info("Certificate and key already exist.")
-    except FileNotFoundError:
-        logging.info("Generating a new certificate and key...")
-        subprocess.call([
-            'openssl', 'req', '-x509', '-newkey', 'rsa:4096', '-keyout', key_path, 
-            '-out', cert_path, '-days', '365', '-nodes', '-subj', '/CN=localhost'
-        ])
-        logging.info("Certificate and key generated.")
+    def generate_ecdsa_keys(seed):
+        """Generate ECDSA keys using entropy from a seed."""
+        private_key = ec.derive_private_key(int.from_bytes(seed, byteorder='big'), ec.SECP256R1(), default_backend())
+        return private_key, private_key.public_key()
 
-def generate_ecdsa_keys(seed):
-    """Generate ECDSA keys using entropy from a seed."""
-    private_key = ec.derive_private_key(int.from_bytes(seed, byteorder='big'), ec.SECP256R1(), default_backend())
-    return private_key, private_key.public_key()
+    def sign_message(private_key, message):
+        """Sign a message using the ECDSA private key."""
+        signature = private_key.sign(
+            message.encode(),
+            ec.ECDSA(hashes.SHA256())
+        )
+        return signature
 
-def sign_message(private_key, message):
-    """Sign a message using the ECDSA private key."""
-    signature = private_key.sign(
-        message.encode(),
-        ec.ECDSA(hashes.SHA256())
-    )
-    return signature
+    def verify_signature(public_key, message, signature):
+        """Verify a message signature using the ECDSA public key."""
+        try:
+            public_key.verify(signature, message.encode(), ec.ECDSA(hashes.SHA256()))
+            return True
+        except InvalidSignature:
+            return False
 
-def verify_signature(public_key, message, signature):
-    """Verify a message signature using the ECDSA public key."""
-    try:
-        public_key.verify(signature, message.encode(), ec.ECDSA(hashes.SHA256()))
-        return True
-    except InvalidSignature:
-        return False
+    def initialize_triangles(base):
+        """Initialize triangles for Penrose tiling."""
+        triangles = []
+        for i in range(base * 2):
+            angle = (2 * i * math.pi) / base
+            v2 = complex(math.cos(angle), math.sin(angle))
+            triangles.append(("thin", 0 + 0j, v2, v2 * complex(math.cos(math.pi / base), math.sin(math.pi / base))))
+        return triangles
 
-def initialize_triangles(base):
-    """Initialize triangles for Penrose tiling."""
-    triangles = []
-    for i in range(base * 2):
-        angle = (2 * i * math.pi) / base
-        v2 = complex(math.cos(angle), math.sin(angle))
-        triangles.append(("thin", 0 + 0j, v2, v2 * complex(math.cos(math.pi / base), math.sin(math.pi / base))))
-    return triangles
+    def subdivide_triangles(triangles, iterations, phi):
+        """Subdivide triangles and collect choices as entropy."""
+        choices = []
+        for _ in range(iterations):
+            new_triangles = []
+            for shape, v1, v2, v3 in triangles:
+                choice = secrets.choice(['A', 'B'])
+                choices.append(choice)
+                new_triangles.extend(subdivision_logic(shape, v1, v2, v3, phi, choice))
+            triangles = new_triangles
+        return triangles, ''.join(choices)
 
-def subdivide_triangles(triangles, iterations, phi):
-    """Subdivide triangles and collect choices as entropy."""
-    choices = []
-    for _ in range(iterations):
-        new_triangles = []
-        for shape, v1, v2, v3 in triangles:
-            choice = secrets.choice(['A', 'B'])
-            choices.append(choice)
-            new_triangles.extend(subdivision_logic(shape, v1, v2, v3, phi, choice))
-        triangles = new_triangles
-    return triangles, ''.join(choices)
+    def subdivision_logic(shape, v1, v2, v3, phi, choice):
+        """Logic for subdividing triangles based on shape and choice."""
+        if shape == "thin":
+            p = v1 + (v2 - v1) / phi
+            return [("thin", v3, p, v2), ("thick", p, v3, v1)]
+        else:
+            p = v2 + (v3 - v2) / phi
+            return [("thin", v2, p, v1), ("thick", p, v3, v2)]
 
-def subdivision_logic(shape, v1, v2, v3, phi, choice):
-    """Logic for subdividing triangles based on shape and choice."""
-    if shape == "thin":
-        p = v1 + (v2 - v1) / phi
-        return [("thin", v3, p, v2), ("thick", p, v3, v1)]
-    else:
-        p = v2 + (v3 - v2) / phi
-        return [("thin", v2, p, v1), ("thick", p, v3, v2)]
+    def generate_seed(choices, base):
+        """
+        Generate a cryptographic seed from the choices and Penrose tiling base,
+        incorporating the Penrose tiling 'choices' into the hash input.
+        """
+        # Use the Penrose tiling choices directly in the hash input
+        seed_input = choices + str(base)
+        return hashlib.sha256(seed_input.encode()).digest()
 
-def generate_seed(choices, base):
-    """
-    Generate a cryptographic seed from the choices and Penrose tiling base,
-    incorporating the Penrose tiling 'choices' into the hash input.
-    """
-    # Use the Penrose tiling choices directly in the hash input
-    seed_input = choices + str(base)
-    return hashlib.sha256(seed_input.encode()).digest()
+    def derive_key(seed, salt):
+        """Derive a cryptographic key using HKDF."""
+        hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=b'penrose-tiling-key', backend=default_backend())
+        return hkdf.derive(seed)
 
-def derive_key(seed, salt):
-    """Derive a cryptographic key using HKDF."""
-    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=b'penrose-tiling-key', backend=default_backend())
-    return hkdf.derive(seed)
-
-def initialize_cipher(key):
-    iv = secrets.token_bytes(16)
-    cipher = Cipher(algorithms.AES(key), modes.CFB(iv), backend=default_backend())
-    return cipher, iv
-
-def generate_iv(base, divisions):
-    """Generate an IV based on Penrose tiling."""
-    _, choices = subdivide_triangles(initialize_triangles(base), divisions, (1 + math.sqrt(5)) / 2)
-    # Use the generated choices to create a seed for the IV
-    seed = hashlib.sha256(''.join(choices).encode()).digest()
-    # Use the first 16 bytes of the seed as the IV for AES, which requires a 128-bit (16-byte) IV for CFB mode
-    iv = seed[:16]
-    return iv
-
-def encrypt_message(key, iv, message):
-    """Encrypt a message using AES with the derived key and provided IV."""
-    try:
+    def initialize_cipher(key):
+        iv = secrets.token_bytes(16)
         cipher = Cipher(algorithms.AES(key), modes.CFB(iv), backend=default_backend())
-        encryptor = cipher.encryptor()
-        ciphertext = encryptor.update(message.encode()) + encryptor.finalize()
-        return ciphertext
-    except Exception as e:
-        logging.error(f"Message encryption error: {e}")
-        return None
+        return cipher, iv
 
-def decrypt_message(key, iv, encrypted_message):
-    """Decrypt a message using AES with the derived key and provided IV."""
-    try:
-        cipher = Cipher(algorithms.AES(key), modes.CFB(iv), backend=default_backend())
-        decryptor = cipher.decryptor()
-        decrypted_message = decryptor.update(encrypted_message) + decryptor.finalize()
-        return decrypted_message.decode()
-    except Exception as e:
-        logging.error(f"Message decryption error: {e}")
-        return None
+    def generate_iv(base, divisions):
+        """Generate an IV based on Penrose tiling."""
+        _, choices = subdivide_triangles(initialize_triangles(base), divisions, (1 + math.sqrt(5)) / 2)
+        # Use the generated choices to create a seed for the IV
+        seed = hashlib.sha256(''.join(choices).encode()).digest()
+        # Use the first 16 bytes of the seed as the IV for AES, which requires a 128-bit (16-byte) IV for CFB mode
+        iv = seed[:16]
+        return iv
 
-def assess_entropy(choices):
-    """Assess the entropy of the choices string using statistical tests."""
-    freqs = Counter(choices)
-    total_chars = len(choices)
-    _, p_value = chisquare(list(freqs.values()))  # Chi-squared test for randomness
-    return p_value >= 0.01  # Threshold for statistical significance
+    def encrypt_message(key, iv, message):
+        """Encrypt a message using AES with the derived key and provided IV."""
+        try:
+            cipher = Cipher(algorithms.AES(key), modes.CFB(iv), backend=default_backend())
+            encryptor = cipher.encryptor()
+            ciphertext = encryptor.update(message.encode()) + encryptor.finalize()
+            return ciphertext
+        except Exception as e:
+            logging.error(f"Message encryption error: {e}")
+            return None
+
+    def decrypt_message(key, iv, encrypted_message):
+        """Decrypt a message using AES with the derived key and provided IV."""
+        try:
+            cipher = Cipher(algorithms.AES(key), modes.CFB(iv), backend=default_backend())
+            decryptor = cipher.decryptor()
+            decrypted_message = decryptor.update(encrypted_message) + decryptor.finalize()
+            return decrypted_message.decode()
+        except Exception as e:
+            logging.error(f"Message decryption error: {e}")
+            return None
+
+    def assess_entropy(choices):
+        """Assess the entropy of the choices string using statistical tests."""
+        freqs = Counter(choices)
+        total_chars = len(choices)
+        _, p_value = chisquare(list(freqs.values()))  # Chi-squared test for randomness
+        return p_value >= 0.01  # Threshold for statistical significance
+
+class EntropyDataset:
+    def __init__(self, filename='entropy_dataset.csv'):
+        self.filename = filename
+        self.headers = ['base', 'divisions', 'choices', 'entropy', 'randomness_score']
+
+        # Initialize the CSV file with headers if it's new
+        try:
+            with open(self.filename, 'x', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=self.headers)
+                writer.writeheader()
+        except FileExistsError:
+            pass  # File already exists, no need to add headers
+
+    def add_entry(self, base, divisions, choices, entropy, randomness_score):
+        with open(self.filename, 'a', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=self.headers)
+            writer.writerow({
+                'base': base,
+                'divisions': divisions,
+                'choices': choices,
+                'entropy': base64.b64encode(entropy).decode(),
+                'randomness_score': randomness_score
+            })
+
+    def collect_entropy_data(self, num_entries=100):
+        """Collect and save entropy data."""
+        # Check if file exists
+        if not os.path.exists(self.filename):
+            # Initialize CSV file with headers
+            with open(self.filename, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=self.headers)
+                writer.writeheader()
+
+            # Collect entropy data
+            for _ in range(num_entries):
+                base, divisions = self._generate_random_parameters()
+                choices_str, seed, randomness_score = self._generate_entropy_data(base, divisions)
+                self.add_entry(base, divisions, choices_str, seed, randomness_score)
+            logging.info(f"Collected {num_entries} entropy data entries.")
+
+    def _generate_random_parameters(self):
+        """Generate random parameters for entropy data collection."""
+        # Example: generate random 'base' and 'divisions' parameters
+        base = secrets.randbelow(10) + 5  # Random base between 5 and 14
+        divisions = secrets.randbelow(5) + 1  # Random divisions between 1 and 5
+        return base, divisions
+
+    def _generate_entropy_data(self, base, divisions):
+        """Generate a single entry of entropy data."""
+        # Implement your entropy data generation logic here
+        # For demonstration, this will be a placeholder returning random values
+        choices_str = ''.join(secrets.choice(['A', 'B']) for _ in range(10))
+        seed = hashlib.sha256(choices_str.encode()).digest()
+        randomness_score = secrets.randbelow(100) / 100  # Random score between 0 and 1
+        return choices_str, seed, randomness_score
+
+    def load_and_split_data(self, test_size=0.2, validation_size=0.1):
+        """Load the dataset from CSV and split into train, validation, and test sets."""
+        # Load dataset
+        df = pd.read_csv(self.filename)
+
+        # Split dataset into train and temporary test
+        train_df, temp_test_df = train_test_split(df, test_size=test_size + validation_size, random_state=42, shuffle=True)
+
+        # Further split the temporary test set into validation and test sets
+        validation_size_adjusted = validation_size / (test_size + validation_size)
+        validation_df, test_df = train_test_split(temp_test_df, test_size=validation_size_adjusted, random_state=42, shuffle=True)
+
+        return train_df, validation_df, test_df
+
+entropy_dataset = EntropyDataset()
 
 # Unit tests for key functions
 class TestPenroseFunctions(unittest.TestCase):
